@@ -22,15 +22,152 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from audit.replay import list_threads
+from common.db import db_conn, db_path
+from exercises.exercise_4_audit import build_graph
 
 
 load_dotenv()
+
+
+# ─── Helper functions (define before using in page layout) ──────────────────
+
+
+async def _fetch_threads():
+    """Fetch recent threads from audit_events for the sidebar."""
+    async with db_conn() as conn:
+        async with conn.execute(
+            """
+            SELECT thread_id,
+                   pr_url,
+                   MIN(timestamp)        AS started,
+                   MAX(timestamp)        AS last_event,
+                   MAX(risk_level)       AS worst_risk,
+                   COUNT(*)              AS events
+              FROM audit_events
+             GROUP BY thread_id, pr_url
+             ORDER BY MAX(timestamp) DESC
+             LIMIT 10
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows] if rows else []
+
+
+async def run_graph(pr_url: str, thread_id: str, resume_value=None):
+    """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
+    async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
+        await cp.setup()
+        app = build_graph(cp)
+        cfg = {"configurable": {"thread_id": thread_id}}
+
+        if resume_value is None:
+            result = await app.ainvoke(
+                {"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        else:
+            result = await app.ainvoke(Command(resume=resume_value), cfg)
+        return result
+
+
+def render_approval_card(payload: dict) -> dict | None:
+    """58–72% bucket: show the LLM review + 3 buttons. Return resume dict or None."""
+    conf = payload["confidence"]
+    st.subheader(f"Approval requested — confidence {conf:.0%}")
+    st.caption(payload["confidence_reasoning"])
+    st.markdown(payload["summary"])
+
+    for c in payload.get("comments", []):
+        st.markdown(f"- **[{c['severity']}]** `{c['file']}:{c.get('line') or '?'}` — {c['body']}")
+
+    with st.expander("Diff"):
+        st.code(payload.get("diff_preview", ""), language="diff")
+
+    feedback = st.text_input("Feedback (optional)", key="approval_feedback")
+    col1, col2, col3 = st.columns(3)
+    
+    if col1.button("Approve", type="primary", key="approve_btn"):
+        return {"choice": "approve", "feedback": feedback}
+    if col2.button("Reject", key="reject_btn"):
+        return {"choice": "reject", "feedback": feedback}
+    if col3.button("Edit", key="edit_btn"):
+        return {"choice": "edit", "feedback": feedback}
+    return None
+
+
+def render_escalation_card(payload: dict) -> dict | None:
+    """< 58% bucket: show risk factors + question form. Return {question: answer} or None."""
+    conf = payload["confidence"]
+    st.subheader(f"Strong escalation — confidence {conf:.0%}")
+    st.caption(payload["confidence_reasoning"])
+    if payload.get("risk_factors"):
+        st.error("Risks: " + ", ".join(payload["risk_factors"]))
+    st.markdown(payload["summary"])
+
+    with st.form("escalation"):
+        answers: dict[str, str] = {}
+        for q in payload.get("questions", []):
+            answers[q] = st.text_area(f"Q: {q}", key=f"esc_{q}")
+        if st.form_submit_button("Submit answers", type="primary"):
+            return answers
+    return None
+
+
+async def run_graph(pr_url: str, thread_id: str, resume_value=None):
+    """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
+    async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
+        await cp.setup()
+        app = build_graph(cp)
+        cfg = {"configurable": {"thread_id": thread_id}}
+
+        if resume_value is None:
+            result = await app.ainvoke(
+                {"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        else:
+            result = await app.ainvoke(Command(resume=resume_value), cfg)
+        return result
+
+
+def render_approval_card(payload: dict) -> dict | None:
+    """58–72% bucket: show the LLM review + 3 buttons. Return resume dict or None."""
+    conf = payload["confidence"]
+    st.subheader(f"Approval requested — confidence {conf:.0%}")
+    st.caption(payload["confidence_reasoning"])
+    st.markdown(payload["summary"])
+
+    for c in payload.get("comments", []):
+        st.markdown(f"- **[{c['severity']}]** `{c['file']}:{c.get('line') or '?'}` — {c['body']}")
+
+    with st.expander("Diff"):
+        st.code(payload.get("diff_preview", ""), language="diff")
+
+    feedback = st.text_input("Feedback (optional)", key="approval_feedback")
+    col1, col2, col3 = st.columns(3)
+    
+    if col1.button("Approve", type="primary", key="approve_btn"):
+        return {"choice": "approve", "feedback": feedback}
+    if col2.button("Reject", key="reject_btn"):
+        return {"choice": "reject", "feedback": feedback}
+    if col3.button("Edit", key="edit_btn"):
+        return {"choice": "edit", "feedback": feedback}
+    return None
+
+
+def render_escalation_card(payload: dict) -> dict | None:
+    """< 58% bucket: show risk factors + question form. Return {question: answer} or None."""
+    conf = payload["confidence"]
+    st.subheader(f"Strong escalation — confidence {conf:.0%}")
+    st.caption(payload["confidence_reasoning"])
+    if payload.get("risk_factors"):
+        st.error("Risks: " + ", ".join(payload["risk_factors"]))
+    st.markdown(payload["summary"])
+
+    with st.form("escalation"):
+        answers: dict[str, str] = {}
+        for q in payload.get("questions", []):
+            answers[q] = st.text_area(f"Q: {q}", key=f"esc_{q}")
+        if st.form_submit_button("Submit answers", type="primary"):
+            return answers
+    return None
 
 
 # ─── Session state ─────────────────────────────────────────────────────────
@@ -52,10 +189,14 @@ st.title("HITL PR Review Agent")
 # ─── Sidebar — recent sessions ─────────────────────────────────────────────
 with st.sidebar:
     st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+    try:
+        threads = asyncio.run(_fetch_threads())
+        if threads:
+            st.dataframe(threads, use_container_width=True)
+        else:
+            st.caption("No recent sessions")
+    except Exception as e:
+        st.caption(f"Error loading sessions: {e}")
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
@@ -65,72 +206,6 @@ with st.form("start"):
         placeholder="https://github.com/VinUni-AI20k/PR-Demo/pull/1",
     )
     submitted = st.form_submit_button("Run review")
-
-
-# ─── Renderers per interrupt kind ──────────────────────────────────────────
-def render_approval_card(payload: dict) -> dict | None:
-    """58–72% bucket: show the LLM review + 3 buttons. Return resume dict or None."""
-    conf = payload["confidence"]
-    st.subheader(f"Approval requested — confidence {conf:.0%}")
-    st.caption(payload["confidence_reasoning"])
-    st.markdown(payload["summary"])
-
-    for c in payload.get("comments", []):
-        st.markdown(f"- **[{c['severity']}]** `{c['file']}:{c.get('line') or '?'}` — {c['body']}")
-
-    with st.expander("Diff"):
-        st.code(payload.get("diff_preview", ""), language="diff")
-
-    feedback = st.text_input("Feedback (optional)", key="approval_feedback")
-    col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
-    if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
-    if col2.button("Reject"):
-        ...
-    if col3.button("Edit"):
-        ...
-    return None
-
-
-def render_escalation_card(payload: dict) -> dict | None:
-    """< 58% bucket: show risk factors + question form. Return {question: answer} or None."""
-    conf = payload["confidence"]
-    st.subheader(f"Strong escalation — confidence {conf:.0%}")
-    st.caption(payload["confidence_reasoning"])
-    if payload.get("risk_factors"):
-        st.error("Risks: " + ", ".join(payload["risk_factors"]))
-    st.markdown(payload["summary"])
-
-    with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
-        answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
-    return None
-
-
-# ─── Drive the graph ───────────────────────────────────────────────────────
-async def run_graph(pr_url: str, thread_id: str, resume_value=None):
-    """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
-    async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
-        await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
-        cfg = {"configurable": {"thread_id": thread_id}}
-
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
